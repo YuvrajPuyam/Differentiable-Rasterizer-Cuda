@@ -1,0 +1,10 @@
+setup.py
+csrc/binding.cpp
+csrc/rasterize_backward.cu
+csrc/rasterize_forward.cu
+diff_rast/__init__.py
+diff_rast/rasterizer.py
+diff_rast.egg-info/PKG-INFO
+diff_rast.egg-info/SOURCES.txt
+diff_rast.egg-info/dependency_links.txt
+diff_rast.egg-info/top_level.txt
