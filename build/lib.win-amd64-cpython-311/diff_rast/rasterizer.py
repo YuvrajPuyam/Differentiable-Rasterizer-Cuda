@@ -11,11 +11,10 @@ class SoftRasterizerFunction(Function):
         """
         verts: (B, V, 3) float32
         faces: (F, 3) int32 or int64
-        Returns:
-            image: (B, 1, H, W)
         """
+        # For checkpoint 1, we just call a dummy CUDA op that returns zeros
         image = _C.rasterize_forward(verts, faces, image_size)
-        # Save for backward (we might need verts/faces later for real gradients)
+        # Save things for backward if needed later
         ctx.save_for_backward(verts, faces)
         ctx.image_size = image_size
         return image
@@ -25,7 +24,7 @@ class SoftRasterizerFunction(Function):
         verts, faces = ctx.saved_tensors
         image_size = ctx.image_size
 
-        # Now this calls the CUDA backward that produces non-zero grads for verts[:,0,0]
+        # Dummy backward: return zeros for vertex gradients
         grad_verts = _C.rasterize_backward(
             grad_image.contiguous(), verts, faces, image_size
         )

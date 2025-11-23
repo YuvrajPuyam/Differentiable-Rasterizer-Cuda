@@ -1,6 +1,2 @@
 # ninja log v7
-2	13483	7855445921168354	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/binding.obj	2c254695080ad7a1
-6	22396	7855445921242738	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	75c5123d93dca67d
-13	22413	7855445921242738	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	a870230fff60b8f7
-29	18668	7855450912254836	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	a870230fff60b8f7
-23	18849	7855450912208267	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	75c5123d93dca67d
+0	11157	7855701543599301	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/binding.obj	605bfe877b62f2b4

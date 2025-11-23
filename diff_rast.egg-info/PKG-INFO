@@ -1,5 +1,4 @@
-Metadata-Version: 2.4
-Name: diff_rast
+Metadata-Version: 2.1
+Name: diff-rast
 Version: 0.0.1
 Summary: Minimal differentiable rasterizer experiments
-Dynamic: summary

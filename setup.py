@@ -1,10 +1,14 @@
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch
+cc_major, cc_minor = torch.cuda.get_device_capability()
+cc = f"{cc_major}{cc_minor}"  # e.g. "86" for RTX 30xx
 
+print("THIS IS CC", cc)
 CUDA_FLAGS = {
     "nvcc": [
         "-O2",
-        "--generate-code=arch=compute_120,code=sm_120"  # Change this line!
+        f"-gencode=arch=compute_{cc},code=sm_{cc}",
     ]
 }
 
