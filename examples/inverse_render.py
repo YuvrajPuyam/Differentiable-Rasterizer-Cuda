@@ -26,7 +26,7 @@ from helper.visualizer import save_silhouette_image
 
 # ---------- Config ----------
 
-MESH_PATH = r"D:\Computer Graphics\diff_rast\data\models\Tree_2.obj"  # change to your car model
+MESH_PATH = r"D:\Computer Graphics\diff_rast\data\models\Tree_2.obj"  #
 OUT_DIR = "opt_vis_car_stage1_multiview_pure_sil"
 
 IMAGE_SIZE = 128
