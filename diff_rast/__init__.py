@@ -1,1 +1,1 @@
-from .rasterizer import SoftRasterizer
+from .rasterizer import SoftRasterizerFunction

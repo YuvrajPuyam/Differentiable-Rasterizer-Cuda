@@ -1,62 +1,71 @@
 // csrc/rasterize_forward.cu
 //
-// Forward CUDA kernel for multi-triangle soft silhouettes (SoftRas-style)
-//
-// Notes:
-// - verts: (B, V, 3) in NDC space [-1, 1]
-// - faces: (F, 3) with int64 indices
-// - output: (B, 1, H, W), values in (0, 1)
-// - Silhouette per pixel: S = 1 - prod_f (1 - alpha_pf)
-//   where alpha_pf = sigmoid(-d_pixels / gamma)
-//
-// We ignore z here (pure orthographic silhouette in screen space).
+// Minimal Soft Rasterizer forward (silhouette + RGB).
+// verts:   (B, V, 3) in NDC (x, y, z)
+// faces:   (F, 3)
+// colors:  (B, V, 3) RGB in [0,1]
+// outputs:
+//   sil: (B, 1, H, W)   layout (B,1,H,W)
+//   rgb: (B, 3, H, W)   layout (B,3,H,W)
 
-#include <torch/types.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <math.h>
+#include <ATen/ATen.h>
+#include <vector>
+
+using at::Tensor;
 
 namespace {
 
-__device__ inline float edge_function(
-    float ax, float ay,
-    float bx, float by,
-    float px, float py) {
-    // 2D cross product (B - A) x (P - A)
-    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+__device__ inline int pixel_index(int b, int y, int x, int image_size) {
+    return b * image_size * image_size + y * image_size + x;  // (B,1,H,W) flatten
 }
 
-__device__ inline float point_segment_distance(
+// SoftRas-like barycentric metric: D = min(a, b, c).
+// Returns true if pixel is worth considering for this triangle,
+// and writes D_out; otherwise returns false.
+__device__ inline bool soft_barycentric_metric(
     float px, float py,
-    float ax, float ay,
-    float bx, float by) {
+    float x0, float y0,
+    float x1, float y1,
+    float x2, float y2,
+    float &D_out
+) {
+    // Tight NDC bbox with tiny margin
+    float minx = fminf(x0, fminf(x1, x2)) - 1e-4f;
+    float maxx = fmaxf(x0, fmaxf(x1, x2)) + 1e-4f;
+    float miny = fminf(y0, fminf(y1, y2)) - 1e-4f;
+    float maxy = fmaxf(y0, fmaxf(y1, y2)) + 1e-4f;
 
-    float vx = bx - ax;
-    float vy = by - ay;
-    float wx = px - ax;
-    float wy = py - ay;
+    if (px < minx || px > maxx || py < miny || py > maxy) {
+        return false;
+    }
 
-    float vv = vx * vx + vy * vy + 1e-8f;  // avoid divide-by-zero
-    float t = (vx * wx + vy * wy) / vv;
-    t = fmaxf(0.0f, fminf(1.0f, t));       // clamp to segment
+    // Barycentric coordinates (standard formula)
+    float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+    if (fabsf(denom) < 1e-8f) {
+        // Degenerate triangle
+        return false;
+    }
+    float inv_denom = 1.0f / denom;
 
-    float cx = ax + t * vx;
-    float cy = ay + t * vy;
+    float a = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) * inv_denom;
+    float b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) * inv_denom;
+    float c = 1.0f - a - b;
 
-    float dx = px - cx;
-    float dy = py - cy;
-    return sqrtf(dx * dx + dy * dy);
+    D_out = fminf(a, fminf(b, c)); // >0 mostly inside, <0 outside
+    return true;
 }
 
 __global__ void rasterize_forward_kernel(
     const float* __restrict__ verts,   // (B, V, 3)
     const int64_t* __restrict__ faces, // (F, 3)
-    int B,
-    int V,
-    int F,
+    const float* __restrict__ colors,  // (B, V, 3)
+    int B, int V, int F,
     int image_size,
-    float* __restrict__ out) {         // (B, 1, H, W) flattened to (B * H * W)
-
+    float* __restrict__ out_sil,       // (B * H * W)
+    float* __restrict__ out_rgb        // (B * 3 * H * W)
+) {
     int b = blockIdx.z;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,132 +74,164 @@ __global__ void rasterize_forward_kernel(
         return;
     }
 
-    int pixel_index = b * image_size * image_size + y * image_size + x;
+    const int pix = pixel_index(b, y, x, image_size);
 
-    // Map pixel center to NDC [-1, 1]
-    // (x + 0.5) / image_size in [0,1] → scale & shift to [-1,1]
-    float px = 2.0f * ((x + 0.5f) / float(image_size)) - 1.0f;
-    float py = 2.0f * ((y + 0.5f) / float(image_size)) - 1.0f;
+    // Pixel center in NDC [-1, 1]
+    const float px = ((x + 0.5f) / image_size) * 2.0f - 1.0f;
+    const float py = ((y + 0.5f) / image_size) * 2.0f - 1.0f;
 
-    // 1 pixel in NDC space
-    const float PIXEL_SIZE   = 2.0f / float(image_size);
+    // SoftRas occupancy aggregate: S = 1 - Π_j (1 - alpha_ij)
+    float bg_prod = 1.0f;
 
-    // SoftRas-like gamma, in *pixel units*:
-    // smaller  -> sharper edges (more binary)
-    // larger   -> blurrier edges
-    const float GAMMA_PIXELS = 0.5f;
+    // RGB accumulators (coverage-weighted)
+    float3 accum_rgb = make_float3(0.0f, 0.0f, 0.0f);
+    float  w_rgb     = 0.0f;
 
-    const float EPS       = 1e-6f;
-    const float MIN_BG    = 1e-6f;   // early-out threshold for background prob
+    // Edge softness
+    const float sigma = 1e-2f;  // smaller -> sharper; you can tweak
 
-    // Background probability: prod_f (1 - alpha_pf)
-    float bg_prob = 1.0f;
-
-    // Loop over faces for this pixel
     for (int f = 0; f < F; ++f) {
-        // Face vertex indices
-        int64_t i0 = faces[f * 3 + 0];
-        int64_t i1 = faces[f * 3 + 1];
-        int64_t i2 = faces[f * 3 + 2];
+        int64_t i0 = faces[3 * f + 0];
+        int64_t i1 = faces[3 * f + 1];
+        int64_t i2 = faces[3 * f + 2];
 
-        // Safety check for indices
-        if (i0 < 0 || i0 >= V || i1 < 0 || i1 >= V || i2 < 0 || i2 >= V) {
+        const float* v0 = verts + (b * V + i0) * 3;
+        const float* v1 = verts + (b * V + i1) * 3;
+        const float* v2 = verts + (b * V + i2) * 3;
+
+        float x0 = v0[0], y0 = v0[1], z0 = v0[2];
+        float x1 = v1[0], y1 = v1[1], z1 = v1[2];
+        float x2 = v2[0], y2 = v2[1], z2 = v2[2];
+
+        // Simple clip-range check in z (optional but cheap)
+        float z_min = fminf(z0, fminf(z1, z2));
+        float z_max = fmaxf(z0, fmaxf(z1, z2));
+        if (z_max < -1.0f || z_min > 1.0f) {
             continue;
         }
 
-        // Fetch vertices for batch b
-        // verts layout: [B, V, 3]
-        int base0 = (b * V + int(i0)) * 3;
-        int base1 = (b * V + int(i1)) * 3;
-        int base2 = (b * V + int(i2)) * 3;
-
-        float v0x = verts[base0 + 0];
-        float v0y = verts[base0 + 1];
-        float v1x = verts[base1 + 0];
-        float v1y = verts[base1 + 1];
-        float v2x = verts[base2 + 0];
-        float v2y = verts[base2 + 1];
-
-        // Edge functions for inside test
-        float w0 = edge_function(v1x, v1y, v2x, v2y, px, py);
-        float w1 = edge_function(v2x, v2y, v0x, v0y, px, py);
-        float w2 = edge_function(v0x, v0y, v1x, v1y, px, py);
-
-        // Triangle signed area
-        float area = edge_function(v0x, v0y, v1x, v1y, v2x, v2y);
-        if (area == 0.0f) {
-            // Degenerate triangle, skip
+        // SoftRas barycentric metric (coverage)
+        float D;
+        if (!soft_barycentric_metric(px, py, x0, y0, x1, y1, x2, y2, D)) {
             continue;
         }
 
-        bool same_sign = (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) ||
-                         (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f);
-        bool inside = same_sign;
-
-        // Distance to triangle edges (unsigned)
-        float d0 = point_segment_distance(px, py, v0x, v0y, v1x, v1y);
-        float d1 = point_segment_distance(px, py, v1x, v1y, v2x, v2y);
-        float d2 = point_segment_distance(px, py, v2x, v2y, v0x, v0y);
-        float min_dist = fminf(d0, fminf(d1, d2));
-
-        // Signed distance in NDC units
-        float signed_d = inside ? -min_dist : min_dist;
-
-        // Convert to pixel units
-        float d_pixels = signed_d / PIXEL_SIZE;
-
-        // SoftRas-like silhouette coverage:
-        // alpha = sigmoid(-d / gamma) = 1 / (1 + exp(d / gamma))
-        float alpha = 1.0f / (1.0f + expf(d_pixels / GAMMA_PIXELS));
-
-        // Clamp alpha to avoid exact 0 or 1
-        if (alpha < EPS)         alpha = EPS;
-        if (alpha > 1.0f - EPS)  alpha = 1.0f - EPS;
-
-        float one_minus_alpha = 1.0f - alpha;
-        bg_prob *= one_minus_alpha;
-
-        // If background prob ~0, pixel is effectively foreground already
-        if (bg_prob < MIN_BG) {
-            bg_prob = 0.0f;
-            break;
+        // Coverage probability: alpha ~ 1 inside, ~0 outside
+        float alpha = 1.0f / (1.0f + expf(-D / sigma));
+        if (alpha <= 1e-6f) {
+            continue;
         }
+
+        // Silhouette occupancy aggregate
+        bg_prod *= (1.0f - alpha);
+
+        // Per-face color = average of its 3 vertex colors
+        const float* c0 = colors + (b * V + i0) * 3;
+        const float* c1 = colors + (b * V + i1) * 3;
+        const float* c2 = colors + (b * V + i2) * 3;
+
+        float3 cf;
+        cf.x = (c0[0] + c1[0] + c2[0]) / 3.0f;
+        cf.y = (c0[1] + c1[1] + c2[1]) / 3.0f;
+        cf.z = (c0[2] + c1[2] + c2[2]) / 3.0f;
+
+        accum_rgb.x += alpha * cf.x;
+        accum_rgb.y += alpha * cf.y;
+        accum_rgb.z += alpha * cf.z;
+        w_rgb       += alpha;
     }
 
-    // Final soft silhouette: S = 1 - background probability
-    float S = 1.0f - bg_prob;
-    out[pixel_index] = S;
+    // ---------------------------
+    // Final silhouette
+    // ---------------------------
+    float S = 1.0f - bg_prod;
+    out_sil[pix] = S;
+
+    // ---------------------------
+    // Final RGB write
+    // Tensor layout is (B, 3, H, W)
+    // so flat index for channel c is:
+    //   idx = b*3*H*W + c*H*W + y*W + x
+    // ---------------------------
+    int plane_size = image_size * image_size;              // H * W
+    int base = b * 3 * plane_size + y * image_size + x;    // index for channel 0 at (b,y,x)
+
+    if (S > 1e-6f && w_rgb > 1e-6f) {
+        float inv_w = 1.0f / (w_rgb + 1e-6f);
+        float s_clamped = fminf(fmaxf(S, 0.0f), 1.0f);
+
+        float3 c;
+        c.x = accum_rgb.x * inv_w * s_clamped;
+        c.y = accum_rgb.y * inv_w * s_clamped;
+        c.z = accum_rgb.z * inv_w * s_clamped;
+
+        out_rgb[base + 0 * plane_size] = c.x;  // R
+        out_rgb[base + 1 * plane_size] = c.y;  // G
+        out_rgb[base + 2 * plane_size] = c.z;  // B
+    } else {
+        out_rgb[base + 0 * plane_size] = 0.0f;
+        out_rgb[base + 1 * plane_size] = 0.0f;
+        out_rgb[base + 2 * plane_size] = 0.0f;
+    }
 }
 
 } // anonymous namespace
 
-torch::Tensor rasterize_forward_cuda(
-    torch::Tensor verts,
-    torch::Tensor faces,
-    int image_size) {
 
-    const int B = verts.size(0);
-    const int V = verts.size(1);
-    const int F = faces.size(0);
+// Host launcher called from C++ binding
+std::vector<Tensor> rasterize_forward_cuda(
+    Tensor verts,   // (B, V, 3)
+    Tensor faces,   // (F, 3)
+    Tensor colors,  // (B, V, 3)
+    int image_size)
+{
+    TORCH_CHECK(verts.is_cuda(),  "verts must be a CUDA tensor");
+    TORCH_CHECK(faces.is_cuda(),  "faces must be a CUDA tensor");
+    TORCH_CHECK(colors.is_cuda(), "colors must be a CUDA tensor");
 
-    auto options = verts.options().dtype(torch::kFloat32);
-    auto image = torch::zeros({B, 1, image_size, image_size}, options);
+    TORCH_CHECK(verts.dim() == 3 && verts.size(2) == 3,
+                "verts must be (B, V, 3)");
+    TORCH_CHECK(faces.dim() == 2 && faces.size(1) == 3,
+                "faces must be (F, 3)");
+    TORCH_CHECK(colors.sizes() == verts.sizes(),
+                "colors must be same shape as verts");
+
+    verts  = verts.contiguous();
+    faces  = faces.contiguous();
+    colors = colors.contiguous();
+
+    const int B = static_cast<int>(verts.size(0));
+    const int V = static_cast<int>(verts.size(1));
+    const int F = static_cast<int>(faces.size(0));
+
+    auto opts = verts.options().dtype(at::kFloat);
+
+    Tensor sil = at::zeros({B, 1, image_size, image_size}, opts);
+    Tensor rgb = at::zeros({B, 3, image_size, image_size}, opts);
+
+    const int H = image_size;
+    const int W = image_size;
 
     dim3 block(16, 16, 1);
     dim3 grid(
-        (image_size + block.x - 1) / block.x,
-        (image_size + block.y - 1) / block.y,
+        (W + block.x - 1) / block.x,
+        (H + block.y - 1) / block.y,
         B
     );
 
     rasterize_forward_kernel<<<grid, block>>>(
         verts.data_ptr<float>(),
         faces.data_ptr<int64_t>(),
-        B,
-        V,
-        F,
+        colors.data_ptr<float>(),
+        B, V, F,
         image_size,
-        image.data_ptr<float>());
+        sil.data_ptr<float>(),
+        rgb.data_ptr<float>());
 
-    return image;
+    // Optional debug:
+    // cudaDeviceSynchronize();
+    // TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    //             "rasterize_forward_kernel failed");
+
+    return {sil, rgb};
 }

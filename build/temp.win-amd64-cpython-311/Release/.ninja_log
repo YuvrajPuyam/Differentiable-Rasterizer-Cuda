@@ -1,2 +1,17 @@
 # ninja log v7
 0	11157	7855701543599301	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/binding.obj	605bfe877b62f2b4
+136	11310	7857319397017935	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/binding.obj	2c254695080ad7a1
+140	19980	7857319397147070	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	12380175d041975f
+14	11004	7857327191638721	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/binding.obj	2c254695080ad7a1
+23	16850	7857327191663781	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+19	17001	7857327191663781	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	12380175d041975f
+18	14869	7857335331868781	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+18	17474	7857339834194197	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+15	14891	7857344024118602	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+17	17112	7857348150362096	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+21	22148	7857350751973157	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+35	18341	7857356992603781	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_forward.obj	ec8b310a62a90d20
+28	24661	7857368713890803	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/binding.obj	2c254695080ad7a1
+35	34103	7857368714045646	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	12380175d041975f
+15	15815	7858006851748133	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	12380175d041975f
+23	23331	7858010188746318	D:/Computer Graphics/diff_rast/build/temp.win-amd64-cpython-311/Release/csrc/rasterize_backward.obj	12380175d041975f

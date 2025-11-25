@@ -1,6 +1,6 @@
 # diff_rast/losses.py
 import torch
-
+import torch.nn.functional as F
 
 def build_edge_index(faces: torch.Tensor) -> torch.Tensor:
     """
@@ -109,4 +109,19 @@ def multiview_silhouette_mse(renderer3d,
         pred_k = renderer3d(verts_world, faces, eye, center, up)
         mse_k = ((pred_k - target_k) ** 2).mean()
         total = total + mse_k
+    return total
+
+def multiview_rgb_mse(renderer, verts_world, faces, colors, cameras, targets_rgb):
+    """
+    renderer: SoftRasterizer3D instance
+    verts_world: (B, V, 3)
+    faces:       (F, 3)
+    colors:      (B, V, 3)
+    cameras: list of (eye, center, up) tuples
+    targets_rgb: list of target RGB images, each (B, 3, H, W)
+    """
+    total = 0.0
+    for (eye, center, up), tgt_rgb in zip(cameras, targets_rgb):
+        _, pred_rgb = renderer(verts_world, faces, colors, eye, center, up)
+        total = total + F.mse_loss(pred_rgb, tgt_rgb)
     return total
