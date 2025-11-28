@@ -1,10 +1,9 @@
-# What is a Differentiable Renderer
+#What is a Differentiable Rasterizer
 
-A differentiable renderer is a rendering system where the entire image formation process is differentiable end-to-end. This enables the use of gradient-based optimization to solve inverse graphics problems. Instead of only generating images from 3D scenes (forward rendering), a differentiable renderer allows adjusting 3D geometry, camera parameters, materials, or lighting by comparing rendered images with target images and propagating gradients back to scene parameters.
+A differentiable rasterizer is a rasterization-based rendering system where the steps that convert 3D meshes into 2D images are modified or relaxed so that they remain differentiable with respect to the underlying scene parameters. Classic rasterization uses hard decisions (inside vs outside a triangle, visibility tests, z-buffer comparisons) that block gradient flow. A differentiable rasterizer replaces these discontinuous operations with smooth, gradient-friendly formulations such as soft visibility, probabilistic coverage, and differentiable edge functions.
 
-Differentiable rendering is widely used in 3D reconstruction, neural rendering, inverse graphics, generative modeling, shape optimization, and machine learning pipelines that require rendering as a differentiable operation.
+This enables gradients to flow from pixel-level losses back to mesh vertices, camera parameters, and other scene attributes. As a result, the renderer can be used not only for forward rendering but also for inverse graphics tasks such as silhouette-based reconstruction, geometry refinement, pose estimation, or joint appearance–shape optimization.
 
-Each example includes the original model and the reconstructed geometry obtained through inverse rendering.
 
 ## Reconstruction Gallery
 
