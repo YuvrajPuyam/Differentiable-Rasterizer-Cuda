@@ -1,4 +1,4 @@
-#What is a Differentiable Rasterizer
+# What is a Differentiable Rasterizer
 
 A differentiable rasterizer is a rasterization-based rendering system where the steps that convert 3D meshes into 2D images are modified or relaxed so that they remain differentiable with respect to the underlying scene parameters. Classic rasterization uses hard decisions (inside vs outside a triangle, visibility tests, z-buffer comparisons) that block gradient flow. A differentiable rasterizer replaces these discontinuous operations with smooth, gradient-friendly formulations such as soft visibility, probabilistic coverage, and differentiable edge functions.
 
