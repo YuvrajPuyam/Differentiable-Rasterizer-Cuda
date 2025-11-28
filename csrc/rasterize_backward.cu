@@ -1,9 +1,4 @@
 // csrc/rasterize_backward.cu
-//
-// Backward pass for soft rasterizer with RGB influence on geometry.
-// Fix: Uses analytical quotient rule for barycentric derivatives 
-// instead of rigid-body heuristics to ensure convergence.
-
 #include <cuda_runtime.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -53,12 +48,7 @@ __device__ inline bool soft_barycentric_metric(
     return true;
 }
 
-// -----------------------------------------------------
-// Core Math: Analytical Barycentric Derivative
-// -----------------------------------------------------
 // Calculates d(bary)/d(coord) using the Quotient Rule.
-// bary_val = Numerator / Denominator
-// (u/v)' = (u'v - uv') / v^2  => (u' - val * v') / v
 __device__ void get_barycentric_deriv(
     int which_bary, // 0->a, 1->b, 2->c
     int which_vert, // 0->v0, 1->v1, 2->v2
@@ -66,8 +56,8 @@ __device__ void get_barycentric_deriv(
     float x0, float y0,
     float x1, float y1,
     float x2, float y2,
-    float denom,    // The full area denominator
-    float bary_val, // The current value of a, b, or c
+    float denom,   
+    float bary_val,
     float &dg_dx, float &dg_dy // Outputs: d(val)/dx_i, d(val)/dy_i
 ) {
     float inv_denom = 1.0f / (denom + 1e-8f);
@@ -76,22 +66,20 @@ __device__ void get_barycentric_deriv(
     float d_numer_dx = 0.0f;
     float d_numer_dy = 0.0f;
 
-    // 1. Derivative of the Denominator (Area) w.r.t vertex
-    // denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+    // 1. Derivative of the Denominator (Area) w.r.t verte
     if (which_vert == 0) {
         d_denom_dx = (y1 - y2);
         d_denom_dy = (x2 - x1); 
     } else if (which_vert == 1) {
         d_denom_dx = (y2 - y0);
         d_denom_dy = (x0 - x2);
-    } else { // which_vert == 2
+    } else { 
         d_denom_dx = (y0 - y1);
         d_denom_dy = (x1 - x0);
     }
 
-    // 2. Derivative of the Numerator w.r.t vertex
-    // Note: 'a' is weight for v0, but its numerator depends on v1,v2 edges.
-    if (which_bary == 0) { // Derivs for 'a'
+
+    if (which_bary == 0) { /
         if (which_vert == 1) {
             d_numer_dx = -(py - y2); 
             d_numer_dy = (px - x2);
@@ -99,7 +87,6 @@ __device__ void get_barycentric_deriv(
             d_numer_dx = (py - y1);
             d_numer_dy = -(px - x1);
         }
-        // if which_vert == 0, numerator const w.r.t v0
     } 
     else if (which_bary == 1) { // Derivs for 'b'
         if (which_vert == 0) {
@@ -110,18 +97,14 @@ __device__ void get_barycentric_deriv(
             d_numer_dy = (px - x0);
         }
     } 
-    // For 'c', we will calculate it as -(da + db) later, 
-    // so we don't strictly need this block, but it's here for completeness if needed.
 
-    // 3. Quotient rule
     dg_dx = (d_numer_dx - bary_val * d_denom_dx) * inv_denom;
     dg_dy = (d_numer_dy - bary_val * d_denom_dy) * inv_denom;
 }
 
 
-// ---------------------------------------------
 // Backward kernel
-// ---------------------------------------------
+
 __global__ void rasterize_backward_kernel(
     const float* __restrict__ verts,     // (B,V,3)
     const int64_t* __restrict__ faces,   // (F,3)
@@ -144,14 +127,13 @@ __global__ void rasterize_backward_kernel(
     const int W = image_size;
     const int pix = pixel_index(b, y, x, image_size);
 
-    // NDC pixel center in [-1,1]
+ 
     const float px = ((x + 0.5f) / image_size) * 2.0f - 1.0f;
     const float py = ((y + 0.5f) / image_size) * 2.0f - 1.0f;
 
-    // Upstream grads
     float gS = grad_sil[pix]; 
 
-    // grad_rgb: layout (B,3,H,W)
+
     const int rgb_base = b * 3 * H * W + y * W + x;
     float3 gC;
     gC.x = grad_rgb[rgb_base + 0 * H * W];
@@ -165,9 +147,7 @@ __global__ void rasterize_backward_kernel(
 
     const float sigma = 1e-2f;  // softness
 
-    // ------------------------------
-    // First pass: compute w_sum and color C
-    // ------------------------------
+   
     float w_sum = 0.0f;
     float3 col_sum = make_float3(0.0f, 0.0f, 0.0f);
 
@@ -246,7 +226,6 @@ __global__ void rasterize_backward_kernel(
 
         float D = fminf(a_val, fminf(b_val, c_val));
 
-        // Quick bbox check again to match forward pass logic
         float minx = fminf(x0, fminf(x1, x2)) - 1e-4f;
         float maxx = fmaxf(x0, fmaxf(x1, x2)) + 1e-4f;
         float miny = fminf(y0, fminf(y1, y2)) - 1e-4f;
@@ -306,24 +285,21 @@ __global__ void rasterize_backward_kernel(
                 get_barycentric_deriv(min_idx, v_idx, px, py, x0, y0, x1, y1, x2, y2, denom, val_to_use, gx, gy);
             }
 
-            // Chain rule
+         
             float grad_x = dL_dD * gx;
             float grad_y = dL_dD * gy;
 
-            // Determine global index
+         
             int64_t target_idx = (v_idx == 0) ? i0 : ((v_idx == 1) ? i1 : i2);
             int base = (b * V + target_idx) * 3;
 
             atomicAdd(&grad_verts[base + 0], grad_x);
             atomicAdd(&grad_verts[base + 1], grad_y);
-            // Z grad is 0 here (orthographic approximation)
+         
         }
     }
 }
 
-// ---------------------------------------------
-// Host launcher
-// ---------------------------------------------
 Tensor rasterize_backward_cuda(
     Tensor grad_sil,   // (B,1,H,W)
     Tensor grad_rgb,   // (B,3,H,W)
