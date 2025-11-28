@@ -3,10 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# =========================================================================
-#  1. Official SoftRas Losses (Optimized & Robust)
-# =========================================================================
-
 class LaplacianLoss(nn.Module):
     """
     Computes the Laplacian smoothing loss.
@@ -140,10 +136,6 @@ class FlattenLoss(nn.Module):
         else:
             return loss
 
-
-# =========================================================================
-#  2. Naive / Functional Losses (Kept for utilities)
-# =========================================================================
 
 def build_edge_index(faces: torch.Tensor) -> torch.Tensor:
     """

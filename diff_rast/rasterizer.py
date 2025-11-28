@@ -1,6 +1,6 @@
 import torch
 from torch.autograd import Function
-import diff_rast._C as _C # compiled CUDA extension
+import diff_rast._C as _C 
 
 
 class SoftRasterizerFunction(Function):
@@ -18,7 +18,7 @@ class SoftRasterizerFunction(Function):
         # Save for backward
         ctx.save_for_backward(verts_ndc, faces, colors)
         ctx.image_size = int(image_size)
-        ctx.use_fd = use_fd  # not used in CUDA, but kept for interface
+        ctx.use_fd = use_fd  
 
         # Two outputs: silhouette + rgb
         return sil, rgb
@@ -35,8 +35,6 @@ class SoftRasterizerFunction(Function):
         B = verts_ndc.size(0)
         H = W = image_size
 
-        # If no gradients come from upstream for an output,
-        # autograd passes None → replace with zeros
         if grad_sil is None:
             grad_sil = verts_ndc.new_zeros(B, 1, H, W)
         if grad_rgb is None:
@@ -45,7 +43,7 @@ class SoftRasterizerFunction(Function):
         grad_sil = grad_sil.contiguous()
         grad_rgb = grad_rgb.contiguous()
 
-        # Our new CUDA backward
+     
         grad_verts = _C.rasterize_backward(
             grad_sil,          # (B,1,H,W)
             grad_rgb,          # (B,3,H,W)

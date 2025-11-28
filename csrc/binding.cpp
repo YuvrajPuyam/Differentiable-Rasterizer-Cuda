@@ -3,7 +3,6 @@
 #include <torch/extension.h>
 #include <vector>
 
-// Implemented in .cu files:
 std::vector<at::Tensor> rasterize_forward_cuda(
     at::Tensor verts,
     at::Tensor faces,
@@ -18,7 +17,6 @@ at::Tensor rasterize_backward_cuda(
     at::Tensor colors,
     int image_size);
 
-// Thin wrappers exposed to Python
 
 std::vector<at::Tensor> rasterize_forward(
     at::Tensor verts,

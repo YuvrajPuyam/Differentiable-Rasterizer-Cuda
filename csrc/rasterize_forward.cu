@@ -1,6 +1,6 @@
 // csrc/rasterize_forward.cu
 //
-// Minimal Soft Rasterizer forward (silhouette + RGB).
+//Minimal Soft Rasterizer forward (silhouette + RGB).
 // verts:   (B, V, 3) in NDC (x, y, z)
 // faces:   (F, 3)
 // colors:  (B, V, 3) RGB in [0,1]
@@ -53,7 +53,7 @@ __device__ inline bool soft_barycentric_metric(
     float b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) * inv_denom;
     float c = 1.0f - a - b;
 
-    D_out = fminf(a, fminf(b, c)); // >0 mostly inside, <0 outside
+    D_out = fminf(a, fminf(b, c)); 
     return true;
 }
 
@@ -122,10 +122,10 @@ __global__ void rasterize_forward_kernel(
             continue;
         }
 
-        // Silhouette occupancy aggregate
+     
         bg_prod *= (1.0f - alpha);
 
-        // Per-face color = average of its 3 vertex colors
+    
         const float* c0 = colors + (b * V + i0) * 3;
         const float* c1 = colors + (b * V + i1) * 3;
         const float* c2 = colors + (b * V + i2) * 3;
@@ -141,20 +141,15 @@ __global__ void rasterize_forward_kernel(
         w_rgb       += alpha;
     }
 
-    // ---------------------------
+
     // Final silhouette
-    // ---------------------------
+
     float S = 1.0f - bg_prod;
     out_sil[pix] = S;
 
-    // ---------------------------
-    // Final RGB write
-    // Tensor layout is (B, 3, H, W)
-    // so flat index for channel c is:
-    //   idx = b*3*H*W + c*H*W + y*W + x
-    // ---------------------------
+    
     int plane_size = image_size * image_size;              // H * W
-    int base = b * 3 * plane_size + y * image_size + x;    // index for channel 0 at (b,y,x)
+    int base = b * 3 * plane_size + y * image_size + x;   
 
     if (S > 1e-6f && w_rgb > 1e-6f) {
         float inv_w = 1.0f / (w_rgb + 1e-6f);
@@ -228,10 +223,7 @@ std::vector<Tensor> rasterize_forward_cuda(
         sil.data_ptr<float>(),
         rgb.data_ptr<float>());
 
-    // Optional debug:
-    // cudaDeviceSynchronize();
-    // TORCH_CHECK(cudaGetLastError() == cudaSuccess,
-    //             "rasterize_forward_kernel failed");
+   
 
     return {sil, rgb};
 }
