@@ -4,16 +4,7 @@ A differentiable renderer is a rendering system where the entire image formation
 
 Differentiable rendering is widely used in 3D reconstruction, neural rendering, inverse graphics, generative modeling, shape optimization, and machine learning pipelines that require rendering as a differentiable operation.
 
-
-# Implementation
-
-This project implements a custom differentiable rasterizer in CUDA and C++ with a PyTorch autograd interface. It supports both forward rendering and inverse rendering using silhouette-based loss functions. All core components including rasterization, camera projection, loss terms, and the multi-view optimization loop are implemented manually for clarity, inspection, and research experimentation.
-
-The system is capable of reconstructing 3D geometry using only a small number of silhouette images by performing gradient-based optimization directly on mesh vertex positions.  
-
-## Example Reconstructions
-
-Each example includes the original model, the silhouette rendered by the CUDA rasterizer, and the reconstructed geometry obtained through inverse rendering.
+Each example includes the original model and the reconstructed geometry obtained through inverse rendering.
 
 ## Reconstruction Gallery
 
@@ -23,7 +14,13 @@ Each example includes the original model, the silhouette rendered by the CUDA ra
 | ![kettle_original](/media/kettle_original.png) | ![kettle_recon](/media/kettle_recon.gif) |
 | ![tree_original](/media/tree_original.png) | ![tree_recon](/media/tree_recon.gif) |
 
+# Implementation
 
+This project implements a custom differentiable rasterizer in CUDA and C++ with a PyTorch autograd interface. It supports both forward rendering and inverse rendering using silhouette-based loss functions. All core components including rasterization, camera projection, loss terms, and the multi-view optimization loop are implemented manually for clarity, inspection, and research experimentation.
+
+The system is capable of reconstructing 3D geometry using only a small number of silhouette images by performing gradient-based optimization directly on mesh vertex positions.  
+
+## Example Reconstructions
 
 
 # Repository Capabilities
