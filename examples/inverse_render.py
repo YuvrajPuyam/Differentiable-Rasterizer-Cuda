@@ -13,7 +13,7 @@ from helper.geometry import generate_icosphere
 from helper.render import render_sil_rgb, make_vertex_colors_from_world
 
 # ===================== Config ===================== #
-MESH_PATH = r"D:\Computer Graphics\diff_rast\data\models\Pistol_02.obj"
+MESH_PATH = r"D:\Computer Graphics\diff_rast\data\models\kettle.glb"
 OUT_DIR = "render_complex_fix"
 IMAGE_SIZE, ITERS, SNAPSHOT_EVERY = 256, 2000, 100
 N_VIEWS, CAM_RADIUS = 12, 3.0
