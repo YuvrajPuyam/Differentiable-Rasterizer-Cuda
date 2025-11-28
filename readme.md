@@ -8,11 +8,11 @@ Each example includes the original model and the reconstructed geometry obtained
 
 ## Reconstruction Gallery
 
-| Original | Reconstruction |
-|----------|----------------|
-| ![avocado_original](/media/avocado.png) | ![avocado_recon](/media/avocado_recon.gif) |
-| ![kettle_original](/media/kettle_original.png) | ![kettle_recon](/media/kettle_recon.gif) |
-| ![tree_original](/media/tree_original.png) | ![tree_recon](/media/tree_recon.gif) |
+|                | Avocado | Kettle | Tree |
+|----------------|---------|--------|-------|
+| **Original**   | ![avocado_original](/media/avocado.png) | ![kettle_original](/media/kettle_original.png) | ![tree_original](/media/tree_original.png) |
+| **Reconstruction** | ![avocado_recon](/media/avocado_recon.gif) | ![kettle_recon](/media/kettle_recon.gif) | ![tree_recon](/media/tree_recon.gif) |
+
 
 # Implementation
 
