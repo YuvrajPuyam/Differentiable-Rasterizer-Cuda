@@ -20,9 +20,6 @@ This project implements a custom differentiable rasterizer in CUDA and C++ with 
 
 The system is capable of reconstructing 3D geometry using only a small number of silhouette images by performing gradient-based optimization directly on mesh vertex positions.  
 
-## Example Reconstructions
-
-
 # Repository Capabilities
 
 ### Forward Rendering
