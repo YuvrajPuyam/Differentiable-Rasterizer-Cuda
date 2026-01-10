@@ -1,35 +1,33 @@
 import torch
 from torch.autograd import Function
-import diff_rast._C as _C 
+import diff_rast._C as _C
 
+_TILE_SIZE = 16
+_MAX_PER_TILE = 512
 
 class SoftRasterizerFunction(Function):
     @staticmethod
     def forward(ctx, verts_ndc, faces, colors, image_size, use_fd=False):
-        """
-        verts_ndc: (B, V, 3) in NDC
-        faces:     (F, 3) long
-        colors:    (B, V, 3) RGB in [0,1]
-        image_size: int
-        use_fd: kept for API compatibility (not used in CUDA)
-        """
-        sil, rgb = _C.rasterize_forward(verts_ndc, faces, colors, int(image_size))
+        image_size = int(image_size)
 
-        # Save for backward
-        ctx.save_for_backward(verts_ndc, faces, colors)
-        ctx.image_size = int(image_size)
-        ctx.use_fd = use_fd  
+        tile_counts, tile_faces = _C.build_bins(
+            verts_ndc, faces, image_size, _TILE_SIZE, _MAX_PER_TILE
+        )
 
-        # Two outputs: silhouette + rgb
+        sil, rgb = _C.rasterize_forward(
+            verts_ndc, faces, colors,
+            tile_counts, tile_faces,
+            image_size, _TILE_SIZE, _MAX_PER_TILE
+        )
+
+        ctx.save_for_backward(verts_ndc, faces, colors, tile_counts, tile_faces)
+        ctx.image_size = image_size
+        ctx.use_fd = use_fd
         return sil, rgb
 
     @staticmethod
     def backward(ctx, grad_sil, grad_rgb):
-        """
-        grad_sil: (B, 1, H, W)
-        grad_rgb: (B, 3, H, W)
-        """
-        verts_ndc, faces, colors = ctx.saved_tensors
+        verts_ndc, faces, colors, tile_counts, tile_faces = ctx.saved_tensors
         image_size = ctx.image_size
 
         B = verts_ndc.size(0)
@@ -43,15 +41,11 @@ class SoftRasterizerFunction(Function):
         grad_sil = grad_sil.contiguous()
         grad_rgb = grad_rgb.contiguous()
 
-     
         grad_verts = _C.rasterize_backward(
-            grad_sil,          # (B,1,H,W)
-            grad_rgb,          # (B,3,H,W)
-            verts_ndc,         # (B,V,3)
-            faces,             # (F,3)
-            colors,            # (B,V,3)
-            int(image_size)
+            grad_sil, grad_rgb,
+            verts_ndc, faces, colors,
+            tile_counts, tile_faces,
+            image_size, _TILE_SIZE, _MAX_PER_TILE
         )
 
-        # No grad for faces/colors/image_size/use_fd
         return grad_verts, None, None, None, None

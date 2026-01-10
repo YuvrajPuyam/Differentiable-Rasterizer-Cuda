@@ -1,0 +1,18 @@
+Baseline:
+
+H=W=256, B=1, V=3000, F=6000
+Forward:  7.421 ms/iter
+Backward: 33.827 ms/iter
+
+Experiment 1: Increase faces to see if face iteration is bottle neck 
+H=W=256, B=1, V=3000, F=20000
+Forward:  24.642 ms/iter
+Backward: 111.873 ms/iter
+
+// can determine face loop is bottlenbeck 
+
+Optimized:
+H=W=256, B=1, V=3000, F=20000
+TILE_SIZE=16, MAX_PER_TILE=512
+Forward:  0.840 ms/iter
+Backward: 3.936 ms/iter

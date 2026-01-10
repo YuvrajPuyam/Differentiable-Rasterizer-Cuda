@@ -19,6 +19,7 @@ ext_modules = [
             "csrc/binding.cpp",
             "csrc/rasterize_forward.cu",
             "csrc/rasterize_backward.cu",
+            "csrc/bin_faces.cu"
         ],
         extra_compile_args=CUDA_FLAGS,
     )
