@@ -1,26 +1,15 @@
 // csrc/rasterize_backward.cu
+// Modular tiled backward with correct product-form silhouette gradient.
 //
-// Tiled backward for minimal Soft Rasterizer.
+// Forward per pixel (over tile face list):
+//   bg_prod = Π_f (1 - alpha_f)
+//   S = 1 - bg_prod
+//   C = (Σ alpha_f * cf) / (Σ alpha_f)
+//   rgb = clamp(S,0,1) * C
 //
-// Inputs:
-//   grad_sil:   (B,1,H,W) float
-//   grad_rgb:   (B,3,H,W) float
-//   verts:      (B,V,3) float  (NDC)
-//   faces:      (F,3)   int64
-//   colors:     (B,V,3) float
-//   tile_counts:(B,T)   int32
-//   tile_faces: (B,T,max) int32
-//
-// Output:
-//   grad_verts: (B,V,3) float  (only x,y get non-zero; z grads = 0)
-//
-// Notes:
-// - Uses your barycentric derivative helper.
-// - Performs two passes per pixel over tile faces:
-//     pass1: compute w_sum and col_sum to get C
-//     pass2: distribute gradients to verts (atomicAdd)
-// - use the simplified silhouette gradient dL/dalpha += gS (
-//   
+// Backward uses:
+//   dS/dalpha_f = bg_prod / (1 - alpha_f)
+// and includes RGB via scaling by S and via C.
 
 #include <cuda_runtime.h>
 #include <ATen/ATen.h>
@@ -29,57 +18,114 @@
 
 using at::Tensor;
 
-// ---------------------------------------------
-// Utility: pixel index in flattened (B, H, W)
-// ---------------------------------------------
+// ------------------------------
+// Constants / eps
+// ------------------------------
+__device__ constexpr float kBBoxMargin = 1e-4f;
+__device__ constexpr float kDenomEps   = 1e-8f;
+__device__ constexpr float kAlphaEps   = 1e-6f;
+__device__ constexpr float kWSumEps    = 1e-6f;
+
+// ------------------------------
+// Index helpers
+// ------------------------------
 __device__ inline int pixel_index(int b, int y, int x, int image_size) {
     return b * image_size * image_size + y * image_size + x;
 }
 
-// ---------------------------------------------
-// Utility: barycentric-based "distance" metric
-// D = min(a,b,c), computed from standard barycentrics.
-// ---------------------------------------------
-__device__ inline bool soft_barycentric_metric(
+__device__ inline float2 pixel_center_ndc(int x, int y, int image_size) {
+    float px = ((x + 0.5f) / image_size) * 2.0f - 1.0f;
+    float py = ((y + 0.5f) / image_size) * 2.0f - 1.0f;
+    return make_float2(px, py);
+}
+
+__device__ inline float clamp01(float v) {
+    return fminf(fmaxf(v, 0.0f), 1.0f);
+}
+
+__device__ inline float3 make_face_color_avg(
+    const float* __restrict__ colors,
+    int b, int V, int64_t i0, int64_t i1, int64_t i2
+) {
+    const float* c0 = colors + (b * V + (int)i0) * 3;
+    const float* c1 = colors + (b * V + (int)i1) * 3;
+    const float* c2 = colors + (b * V + (int)i2) * 3;
+
+    float3 cf;
+    cf.x = (c0[0] + c1[0] + c2[0]) / 3.0f;
+    cf.y = (c0[1] + c1[1] + c2[1]) / 3.0f;
+    cf.z = (c0[2] + c1[2] + c2[2]) / 3.0f;
+    return cf;
+}
+
+__device__ inline bool bbox_reject(
+    float px, float py,
+    float x0, float y0,
+    float x1, float y1,
+    float x2, float y2
+) {
+    float minx = fminf(x0, fminf(x1, x2)) - kBBoxMargin;
+    float maxx = fmaxf(x0, fmaxf(x1, x2)) + kBBoxMargin;
+    float miny = fminf(y0, fminf(y1, y2)) - kBBoxMargin;
+    float maxy = fmaxf(y0, fmaxf(y1, y2)) + kBBoxMargin;
+    return (px < minx || px > maxx || py < miny || py > maxy);
+}
+
+// ------------------------------
+// Barycentrics and alpha
+// ------------------------------
+struct BaryInfo {
+    float a, b, c;
+    float denom;
+    float D;       // min(a,b,c)
+    int min_idx;   // 0:a, 1:b, 2:c
+};
+
+__device__ inline bool compute_bary_info(
     float px, float py,
     float x0, float y0,
     float x1, float y1,
     float x2, float y2,
-    float &D_out)
-{
-    // Quick bbox reject
-    float minx = fminf(x0, fminf(x1, x2)) - 1e-4f;
-    float maxx = fmaxf(x0, fmaxf(x1, x2)) + 1e-4f;
-    float miny = fminf(y0, fminf(y1, y2)) - 1e-4f;
-    float maxy = fmaxf(y0, fmaxf(y1, y2)) + 1e-4f;
-
-    if (px < minx || px > maxx || py < miny || py > maxy) {
-        return false;
-    }
+    BaryInfo& out
+) {
+    if (bbox_reject(px, py, x0, y0, x1, y1, x2, y2)) return false;
 
     float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-    if (fabsf(denom) < 1e-8f) {
-        return false; // degenerate tri
-    }
+    if (fabsf(denom) < kDenomEps) return false;
+
     float inv_denom = 1.0f / denom;
 
     float a = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) * inv_denom;
     float b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) * inv_denom;
     float c = 1.0f - a - b;
 
-    D_out = fminf(a, fminf(b, c));
+    float D = fminf(a, fminf(b, c));
+    int min_idx = 0;
+    if (b < a && b < c) min_idx = 1;
+    if (c < a && c < b) min_idx = 2;
+
+    out.a = a; out.b = b; out.c = c;
+    out.D = D;
+    out.denom = denom;
+    out.min_idx = min_idx;
     return true;
 }
 
-// ---------------------------------------------
-// Barycentric derivative helper 
-// Computes d(bary)/d(x_i,y_i) using quotient rule.
-// which_bary: 0->a, 1->b   (c handled as -da-db outside)
-// which_vert: 0->v0, 1->v1, 2->v2
-// ---------------------------------------------
+__device__ inline float sigmoid_alpha(float D, float sigma) {
+    // You can swap expf -> __expf once you enable fast math
+    return 1.0f / (1.0f + expf(-D / sigma));
+}
+
+__device__ inline float dalpha_dD(float alpha, float sigma) {
+    return alpha * (1.0f - alpha) / sigma;
+}
+
+// ------------------------------
+// Barycentric derivative helper (same math as your original)
+// ------------------------------
 __device__ void get_barycentric_deriv(
-    int which_bary,
-    int which_vert,
+    int which_bary, // 0->a, 1->b
+    int which_vert, // 0->v0, 1->v1, 2->v2
     float px, float py,
     float x0, float y0,
     float x1, float y1,
@@ -88,75 +134,190 @@ __device__ void get_barycentric_deriv(
     float bary_val,
     float &dg_dx, float &dg_dy
 ) {
-    float inv_denom = 1.0f / (denom + 1e-8f);
+    float inv_denom = 1.0f / (denom + kDenomEps);
 
     float d_denom_dx = 0.0f;
     float d_denom_dy = 0.0f;
     float d_numer_dx = 0.0f;
     float d_numer_dy = 0.0f;
 
-    // denom = (y1-y2)*(x0-x2) + (x2-x1)*(y0-y2)
-    // Derivative of denom w.r.t each vertex coord:
+    // denom deriv
     if (which_vert == 0) {
         d_denom_dx = (y1 - y2);
         d_denom_dy = (x2 - x1);
     } else if (which_vert == 1) {
         d_denom_dx = (y2 - y0);
         d_denom_dy = (x0 - x2);
-    } else { // which_vert == 2
+    } else {
         d_denom_dx = (y0 - y1);
         d_denom_dy = (x1 - x0);
     }
 
-    // Numerators:
-    // a_num = (y1-y2)*(px-x2) + (x2-x1)*(py-y2)
-    // b_num = (y2-y0)*(px-x2) + (x0-x2)*(py-y2)
+    // numerator deriv
     if (which_bary == 0) { // a
         if (which_vert == 1) {
-            // da_num/dx1, dy1
             d_numer_dx = -(py - y2);
             d_numer_dy =  (px - x2);
         } else if (which_vert == 2) {
-            // da_num/dx2, dy2
             d_numer_dx =  (py - y1);
             d_numer_dy = -(px - x1);
         }
-        // which_vert==0 -> 0 for numerator
-    } else if (which_bary == 1) { // b
+    } else { // b
         if (which_vert == 0) {
-            // db_num/dx0, dy0
             d_numer_dx =  (py - y2);
             d_numer_dy = -(px - x2);
         } else if (which_vert == 2) {
-            // db_num/dx2, dy2
             d_numer_dx = -(py - y0);
             d_numer_dy =  (px - x0);
         }
-        // which_vert==1 -> 0 for numerator
     }
 
     dg_dx = (d_numer_dx - bary_val * d_denom_dx) * inv_denom;
     dg_dy = (d_numer_dy - bary_val * d_denom_dy) * inv_denom;
 }
 
-// ---------------------------------------------
-// Tiled backward kernel
-// ---------------------------------------------
-__global__ void rasterize_backward_kernel_tiled(
-    const float* __restrict__ verts,        // (B,V,3)
-    const int64_t* __restrict__ faces,      // (F,3)
-    const float* __restrict__ colors,       // (B,V,3)
-    const int32_t* __restrict__ tile_counts,// (B*T)
-    const int32_t* __restrict__ tile_faces, // (B*T*max)
-    const float* __restrict__ grad_sil,     // (B*H*W) flattened view of (B,1,H,W)
-    const float* __restrict__ grad_rgb,     // (B*3*H*W)
+// Route dD/d(x_i,y_i) given BaryInfo and min_idx
+__device__ inline void dD_dvertex_xy(
+    int min_idx,
+    int which_vert,
+    float px, float py,
+    float x0, float y0,
+    float x1, float y1,
+    float x2, float y2,
+    float denom,
+    float a_val,
+    float b_val,
+    float &dD_dx, float &dD_dy
+) {
+    if (min_idx == 2) {
+        // D = c = 1 - a - b
+        float da_dx, da_dy, db_dx, db_dy;
+        get_barycentric_deriv(0, which_vert, px, py, x0, y0, x1, y1, x2, y2, denom, a_val, da_dx, da_dy);
+        get_barycentric_deriv(1, which_vert, px, py, x0, y0, x1, y1, x2, y2, denom, b_val, db_dx, db_dy);
+        dD_dx = -da_dx - db_dx;
+        dD_dy = -da_dy - db_dy;
+    } else {
+        // D = a or b
+        float val = (min_idx == 0) ? a_val : b_val;
+        get_barycentric_deriv(min_idx, which_vert, px, py, x0, y0, x1, y1, x2, y2, denom, val, dD_dx, dD_dy);
+    }
+}
+
+// ------------------------------
+// Tile iteration
+// ------------------------------
+struct TileRange {
+    int base_faces;
+    int count;
+    int T;
+};
+
+__device__ inline TileRange get_tile_range(
+    int b, int x, int y,
+    int tile_size, int tiles_x, int tiles_y,
+    int max_per_tile,
+    const int32_t* __restrict__ tile_counts,
+    const int32_t* __restrict__ tile_faces
+) {
+    TileRange tr;
+    int tx = x / tile_size;
+    int ty = y / tile_size;
+    tx = min(tx, tiles_x - 1);
+    ty = min(ty, tiles_y - 1);
+    int tile = ty * tiles_x + tx;
+
+    tr.T = tiles_x * tiles_y;
+    int idx = b * tr.T + tile;
+    int c = tile_counts[idx];
+    if (c > max_per_tile) c = max_per_tile;
+    tr.count = c;
+    tr.base_faces = (b * tr.T + tile) * max_per_tile;
+    (void)tile_faces; // just to keep signature symmetric if you want to extend later
+    return tr;
+}
+
+// ------------------------------
+// Pass 1 accumulation
+// ------------------------------
+struct PixelAgg {
+    float w_sum;
+    float3 col_sum;
+    float bg_prod;
+};
+
+__device__ inline PixelAgg init_pixel_agg() {
+    PixelAgg a;
+    a.w_sum = 0.0f;
+    a.col_sum = make_float3(0.0f, 0.0f, 0.0f);
+    a.bg_prod = 1.0f;
+    return a;
+}
+
+__device__ inline void accumulate_face(PixelAgg& agg, float alpha, const float3& cf) {
+    if (alpha <= 1e-6f) return;
+    agg.bg_prod *= (1.0f - alpha);
+    agg.w_sum   += alpha;
+    agg.col_sum.x += alpha * cf.x;
+    agg.col_sum.y += alpha * cf.y;
+    agg.col_sum.z += alpha * cf.z;
+}
+
+// ------------------------------
+// dL/dalpha (product-form + rgb)
+// ------------------------------
+__device__ inline float dot3(const float3& a, const float3& b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+__device__ inline float compute_dL_dalpha(
+    float gS,               // dL/dS
+    const float3& gRGB,     // dL/dRGB
+    float alpha,
+    float bg_prod,
+    float S,
+    float s_clamped,
+    float ds_dS,
+    const float3& C,
+    float inv_w_sum,
+    const float3& cf
+) {
+    float one_minus_alpha = fmaxf(1.0f - alpha, kAlphaEps);
+    float dS_dalpha = bg_prod / one_minus_alpha;
+
+    // (1) silhouette contribution
+    float dL_dalpha = gS * dS_dalpha;
+
+    // (2) rgb contribution via scaling by s_clamped (rgb = s*C)
+    float dot_gRGB_C = dot3(gRGB, C);
+    dL_dalpha += (dot_gRGB_C * ds_dS) * dS_dalpha;
+
+    // (3) rgb contribution via C
+    float3 diff = make_float3(cf.x - C.x, cf.y - C.y, cf.z - C.z);
+    float dot_gRGB_diff = dot3(gRGB, diff);
+    dL_dalpha += s_clamped * (dot_gRGB_diff * inv_w_sum);
+
+    return dL_dalpha;
+}
+
+// ------------------------------
+// Kernel
+// ------------------------------
+__global__ void rasterize_backward_kernel_tiled_modular(
+    const float* __restrict__ verts,          // (B,V,3)
+    const int64_t* __restrict__ faces,        // (F,3)
+    const float* __restrict__ colors,         // (B,V,3)
+    const int32_t* __restrict__ tile_counts,  // (B*T)
+    const int32_t* __restrict__ tile_faces,   // (B*T*max)
+    const float* __restrict__ grad_sil,       // (B*H*W)
+    const float* __restrict__ grad_rgb,       // (B*3*H*W)
     int B, int V, int F,
     int image_size,
     int tile_size,
     int tiles_x,
     int tiles_y,
     int max_per_tile,
-    float* __restrict__ grad_verts          // (B,V,3)
+    float sigma,
+    float* __restrict__ grad_verts            // (B,V,3)
 ) {
     int b = blockIdx.z;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -166,51 +327,34 @@ __global__ void rasterize_backward_kernel_tiled(
 
     const int H = image_size;
     const int W = image_size;
-
     const int pix = pixel_index(b, y, x, image_size);
 
-    // Pixel center in NDC
-    const float px = ((x + 0.5f) / image_size) * 2.0f - 1.0f;
-    const float py = ((y + 0.5f) / image_size) * 2.0f - 1.0f;
+    float2 p = pixel_center_ndc(x, y, image_size);
+    float px = p.x, py = p.y;
 
     float gS = grad_sil[pix];
 
-    // grad_rgb layout is (B,3,H,W)
-    const int rgb_base = b * 3 * H * W + y * W + x;
-    float3 gC;
-    gC.x = grad_rgb[rgb_base + 0 * H * W];
-    gC.y = grad_rgb[rgb_base + 1 * H * W];
-    gC.z = grad_rgb[rgb_base + 2 * H * W];
+    // (B,3,H,W) flattened
+    int rgb_base = b * 3 * H * W + y * W + x;
+    float3 gRGB;
+    gRGB.x = grad_rgb[rgb_base + 0 * H * W];
+    gRGB.y = grad_rgb[rgb_base + 1 * H * W];
+    gRGB.z = grad_rgb[rgb_base + 2 * H * W];
 
-    const float gC_mag = fabsf(gC.x) + fabsf(gC.y) + fabsf(gC.z);
-    if (fabsf(gS) < 1e-8f && gC_mag < 1e-8f) {
-        return;
-    }
+    float gRGB_mag = fabsf(gRGB.x) + fabsf(gRGB.y) + fabsf(gRGB.z);
+    if (fabsf(gS) < 1e-8f && gRGB_mag < 1e-8f) return;
 
-    const float sigma = 1e-2f;
+    TileRange tr = get_tile_range(
+        b, x, y, tile_size, tiles_x, tiles_y, max_per_tile,
+        tile_counts, tile_faces
+    );
+    if (tr.count <= 0) return;
 
-    // Tile id for (x,y)
-    int tx = x / tile_size;
-    int ty = y / tile_size;
-    tx = min(tx, tiles_x - 1);
-    ty = min(ty, tiles_y - 1);
-    int tile = ty * tiles_x + tx;
+    // -------- Pass 1: aggregate --------
+    PixelAgg agg = init_pixel_agg();
 
-    const int T = tiles_x * tiles_y;
-    int idx_counts = b * T + tile;
-    int count = tile_counts[idx_counts];
-    if (count > max_per_tile) count = max_per_tile;
-
-    int base_faces = (b * T + tile) * max_per_tile;
-
-    // ---------------------------------------------
-    // Pass 1: compute w_sum, col_sum to get C
-    // ---------------------------------------------
-    float w_sum = 0.0f;
-    float3 col_sum = make_float3(0.0f, 0.0f, 0.0f);
-
-    for (int ii = 0; ii < count; ++ii) {
-        int f = (int)tile_faces[base_faces + ii];
+    for (int ii = 0; ii < tr.count; ++ii) {
+        int f = (int)tile_faces[tr.base_faces + ii];
         if (f < 0 || f >= F) continue;
 
         int64_t i0 = faces[3 * f + 0];
@@ -225,40 +369,32 @@ __global__ void rasterize_backward_kernel_tiled(
         float x1 = v1[0], y1 = v1[1];
         float x2 = v2[0], y2 = v2[1];
 
-        float D;
-        if (!soft_barycentric_metric(px, py, x0, y0, x1, y1, x2, y2, D)) continue;
+        BaryInfo bi;
+        if (!compute_bary_info(px, py, x0, y0, x1, y1, x2, y2, bi)) continue;
 
-        float alpha = 1.0f / (1.0f + expf(-D / sigma));
+        float alpha = sigmoid_alpha(bi.D, sigma);
         if (alpha <= 1e-6f) continue;
 
-        const float* c0 = colors + (b * V + (int)i0) * 3;
-        const float* c1 = colors + (b * V + (int)i1) * 3;
-        const float* c2 = colors + (b * V + (int)i2) * 3;
-
-        float3 cf;
-        cf.x = (c0[0] + c1[0] + c2[0]) / 3.0f;
-        cf.y = (c0[1] + c1[1] + c2[1]) / 3.0f;
-        cf.z = (c0[2] + c1[2] + c2[2]) / 3.0f;
-
-        w_sum += alpha;
-        col_sum.x += alpha * cf.x;
-        col_sum.y += alpha * cf.y;
-        col_sum.z += alpha * cf.z;
+        float3 cf = make_face_color_avg(colors, b, V, i0, i1, i2);
+        accumulate_face(agg, alpha, cf);
     }
 
-    if (w_sum <= 1e-8f) return;
+    if (agg.w_sum <= 1e-8f) return;
 
-    float inv_w_sum = 1.0f / (w_sum + 1e-6f);
-    float3 C;
-    C.x = col_sum.x * inv_w_sum;
-    C.y = col_sum.y * inv_w_sum;
-    C.z = col_sum.z * inv_w_sum;
+    float inv_w_sum = 1.0f / (agg.w_sum + kWSumEps);
+    float3 C = make_float3(
+        agg.col_sum.x * inv_w_sum,
+        agg.col_sum.y * inv_w_sum,
+        agg.col_sum.z * inv_w_sum
+    );
 
-    // ---------------------------------------------
-    // Pass 2: distribute gradients
-    // ---------------------------------------------
-    for (int ii = 0; ii < count; ++ii) {
-        int f = (int)tile_faces[base_faces + ii];
+    float S = 1.0f - agg.bg_prod;
+    float s_clamped = clamp01(S);
+    float ds_dS = (S > 0.0f && S < 1.0f) ? 1.0f : 0.0f;
+
+    // -------- Pass 2: distribute grads --------
+    for (int ii = 0; ii < tr.count; ++ii) {
+        int f = (int)tile_faces[tr.base_faces + ii];
         if (f < 0 || f >= F) continue;
 
         int64_t i0 = faces[3 * f + 0];
@@ -273,97 +409,59 @@ __global__ void rasterize_backward_kernel_tiled(
         float x1 = v1[0], y1 = v1[1];
         float x2 = v2[0], y2 = v2[1];
 
-        // recompute barycentrics for min routing + derivatives
-        float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-        if (fabsf(denom) < 1e-8f) continue;
-        float inv_denom_local = 1.0f / denom;
+        BaryInfo bi;
+        if (!compute_bary_info(px, py, x0, y0, x1, y1, x2, y2, bi)) continue;
 
-        float a_val = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) * inv_denom_local;
-        float b_val = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) * inv_denom_local;
-        float c_val = 1.0f - a_val - b_val;
-
-        float D = fminf(a_val, fminf(b_val, c_val));
-
-        // bbox reject 
-        float minx = fminf(x0, fminf(x1, x2)) - 1e-4f;
-        float maxx = fmaxf(x0, fmaxf(x1, x2)) + 1e-4f;
-        float miny = fminf(y0, fminf(y1, y2)) - 1e-4f;
-        float maxy = fmaxf(y0, fmaxf(y1, y2)) + 1e-4f;
-        if (px < minx || px > maxx || py < miny || py > maxy) continue;
-
-        float alpha = 1.0f / (1.0f + expf(-D / sigma));
+        float alpha = sigmoid_alpha(bi.D, sigma);
         if (alpha <= 1e-6f) continue;
 
-        const float* c0 = colors + (b * V + (int)i0) * 3;
-        const float* c1 = colors + (b * V + (int)i1) * 3;
-        const float* c2 = colors + (b * V + (int)i2) * 3;
+        float3 cf = make_face_color_avg(colors, b, V, i0, i1, i2);
 
-        float3 cf;
-        cf.x = (c0[0] + c1[0] + c2[0]) / 3.0f;
-        cf.y = (c0[1] + c1[1] + c2[1]) / 3.0f;
-        cf.z = (c0[2] + c1[2] + c2[2]) / 3.0f;
+        float dL_dalpha = compute_dL_dalpha(
+            gS, gRGB, alpha,
+            agg.bg_prod, S,
+            s_clamped, ds_dS,
+            C, inv_w_sum,
+            cf
+        );
 
-        // 1) dL/d(alpha) from silhouette 
-        float dL_dalpha = gS;
+        float dL_dD = dL_dalpha * dalpha_dD(alpha, sigma);
 
-        // 2) RGB contribution:
-        // C = sum(alpha*cf)/sum(alpha)
-        // dC/dalpha_f = (cf - C) / w_sum
-        float3 diff;
-        diff.x = cf.x - C.x;
-        diff.y = cf.y - C.y;
-        diff.z = cf.z - C.z;
-
-        float dot_gC_diff = gC.x * diff.x + gC.y * diff.y + gC.z * diff.z;
-        dL_dalpha += dot_gC_diff * inv_w_sum;
-
-        // 3) d(alpha)/dD
-        float dalpha_dD = alpha * (1.0f - alpha) / sigma;
-        float dL_dD = dL_dalpha * dalpha_dD;
-
-        // 4) D = min(a,b,c) routing
-        int min_idx = 0; // 0->a, 1->b, 2->c
-        if (b_val < a_val && b_val < c_val) min_idx = 1;
-        if (c_val < a_val && c_val < b_val) min_idx = 2;
-
-        // distribute to v0,v1,v2
+        // dD/d(x_i,y_i) via min routing
         for (int v_idx = 0; v_idx < 3; ++v_idx) {
-            float gx = 0.0f;
-            float gy = 0.0f;
+            float dD_dx = 0.0f, dD_dy = 0.0f;
+            dD_dvertex_xy(
+                bi.min_idx, v_idx,
+                px, py,
+                x0, y0, x1, y1, x2, y2,
+                bi.denom,
+                bi.a, bi.b,
+                dD_dx, dD_dy
+            );
 
-            if (min_idx == 2) {
-                // c = 1 - a - b  => dc = -da - db
-                float da_dx, da_dy, db_dx, db_dy;
-                get_barycentric_deriv(0, v_idx, px, py, x0, y0, x1, y1, x2, y2, denom, a_val, da_dx, da_dy);
-                get_barycentric_deriv(1, v_idx, px, py, x0, y0, x1, y1, x2, y2, denom, b_val, db_dx, db_dy);
-                gx = -da_dx - db_dx;
-                gy = -da_dy - db_dy;
-            } else {
-                float val_to_use = (min_idx == 0) ? a_val : b_val;
-                get_barycentric_deriv(min_idx, v_idx, px, py, x0, y0, x1, y1, x2, y2, denom, val_to_use, gx, gy);
-            }
+            float grad_x = dL_dD * dD_dx;
+            float grad_y = dL_dD * dD_dy;
 
-            float grad_x = dL_dD * gx;
-            float grad_y = dL_dD * gy;
-
-            int64_t target_idx = (v_idx == 0) ? i0 : ((v_idx == 1) ? i1 : i2);
-            int base = (b * V + (int)target_idx) * 3;
+            int64_t vid = (v_idx == 0) ? i0 : ((v_idx == 1) ? i1 : i2);
+            int base = (b * V + (int)vid) * 3;
 
             atomicAdd(&grad_verts[base + 0], grad_x);
             atomicAdd(&grad_verts[base + 1], grad_y);
-            // z-grad left as 0
         }
     }
 }
 
+// ------------------------------
+// Host wrapper
+// ------------------------------
 Tensor rasterize_backward_cuda(
-    Tensor grad_sil,    // (B,1,H,W)
-    Tensor grad_rgb,    // (B,3,H,W)
-    Tensor verts,       // (B,V,3)
-    Tensor faces,       // (F,3)
-    Tensor colors,      // (B,V,3)
-    Tensor tile_counts, // (B,T) int32
-    Tensor tile_faces,  // (B,T,max) int32
+    Tensor grad_sil,     // (B,1,H,W)
+    Tensor grad_rgb,     // (B,3,H,W)
+    Tensor verts,        // (B,V,3)
+    Tensor faces,        // (F,3)
+    Tensor colors,       // (B,V,3)
+    Tensor tile_counts,  // (B,T) int32
+    Tensor tile_faces,   // (B,T,max) int32
     int image_size,
     int tile_size,
     int max_per_tile
@@ -405,7 +503,6 @@ Tensor rasterize_backward_cuda(
     const int tiles_x = (W + tile_size - 1) / tile_size;
     const int tiles_y = (H + tile_size - 1) / tile_size;
 
-    // Zero-init gradients
     auto grad_verts = at::zeros_like(verts);
 
     dim3 block(16, 16, 1);
@@ -417,7 +514,10 @@ Tensor rasterize_backward_cuda(
 
     const at::cuda::OptionalCUDAGuard device_guard(at::device_of(verts));
 
-    rasterize_backward_kernel_tiled<<<grid, block>>>(
+    // Keep sigma consistent with forward
+    const float sigma = 1e-2f;
+
+    rasterize_backward_kernel_tiled_modular<<<grid, block>>>(
         verts.data_ptr<float>(),
         faces.data_ptr<int64_t>(),
         colors.data_ptr<float>(),
@@ -430,6 +530,7 @@ Tensor rasterize_backward_cuda(
         tile_size,
         tiles_x, tiles_y,
         max_per_tile,
+        sigma,
         grad_verts.data_ptr<float>());
 
     return grad_verts;

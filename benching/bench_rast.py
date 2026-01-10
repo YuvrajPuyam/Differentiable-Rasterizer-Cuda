@@ -111,7 +111,7 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
 
     verts, faces, colors, image_size = make_dummy(
-        B=1, V=3000, F=6000, image_size=256
+        B=1, V=3000, F=20000, image_size=256
     )
 
     bench(verts, faces, colors, image_size)
